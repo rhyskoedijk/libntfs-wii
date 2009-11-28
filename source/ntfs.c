@@ -553,9 +553,6 @@ void ntfsUnmount (const char *name, bool force)
 const char *ntfsGetVolumeName (const char *name)
 {
     ntfs_vd *vd = NULL;
-    ntfs_attr *na = NULL;
-    ntfschar *ulabel = NULL;
-    char *volumeName = NULL;
     
     // Sanity check
     if (!name) {
@@ -570,61 +567,8 @@ const char *ntfsGetVolumeName (const char *name)
         return false;
     }
     
-    // If the volume name has already been cached then just use that
-    if (vd->name[0])
-        return vd->name;
-    
-    // Lock
-    ntfsLock(vd);
-    
-    // Check if the volume name attribute exists
-    na = ntfs_attr_open(vd->vol->vol_ni, AT_VOLUME_NAME, NULL, 0);
-    if (!na) {
-        ntfsUnlock(vd);
-        errno = ENOENT;
-        return false;
-    }
-
-    // Allocate a buffer to store the raw volume name
-    ulabel = ntfs_alloc(na->data_size * sizeof(ntfschar));
-    if (!ulabel) {
-        ntfsUnlock(vd);
-        errno = ENOMEM;
-        return false;
-    }
-    
-    // Read the volume name
-    if (ntfs_attr_pread(na, 0, na->data_size, ulabel) != na->data_size) {
-        ntfs_free(ulabel);
-        ntfsUnlock(vd);
-        errno = EIO;
-        return false;
-    }
-    
-    // Convert the volume name to the current local
-    if (ntfsUnicodeToLocal(ulabel, na->data_size, &volumeName, 0) < 0) {
-        errno = EINVAL;
-        ntfs_free(ulabel);
-        ntfsUnlock(vd);
-        return false;
-    }
-
-    // If the volume name was read then cache it (for future fetches)
-    if (volumeName)
-        strcpy(vd->name, volumeName);
-    
-    // Close the volume name attribute
-    if (na)
-        ntfs_attr_close(na);
-
-    // Clean up
-    ntfs_free(volumeName);
-    ntfs_free(ulabel);
-    
-    // Unlock
-    ntfsUnlock(vd);
-    
-    return vd->name;
+    // Get the volumes name
+    return vd->vol->vol_name;
 }
 
 bool ntfsSetVolumeName (const char *name, const char *volumeName)
@@ -633,7 +577,8 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
     ntfs_attr *na = NULL;
     ntfschar *ulabel = NULL;
     int ulabel_len;
-    
+    char *label = NULL;
+
     // Sanity check
     if (!name) {
         errno = EINVAL;
@@ -649,10 +594,23 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
 
     // Lock
     ntfsLock(vd);
-    
+
+    // Allocate a buffer to hold the new volume name
+    label = ntfs_alloc(strlen(volumeName) + 1);
+    if (!label) {
+        ntfsUnlock(vd);
+        errno = EINVAL;
+        return false;
+    }
+
+    // Copy the new volume name
+    memset(label, 0, strlen(volumeName) + 1);
+    strcpy(label, volumeName);
+
     // Convert the new volume name to unicode
-    ulabel_len = ntfsLocalToUnicode(volumeName, &ulabel) * sizeof(ntfschar);
+    ulabel_len = ntfsLocalToUnicode(label, &ulabel) * sizeof(ntfschar);
     if (ulabel_len < 0) {
+        ntfs_free(label);
         ntfsUnlock(vd);
         errno = EINVAL;
         return false;
@@ -664,6 +622,7 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
         
         // It does, resize it to match the length of the new volume name
         if (ntfs_attr_truncate(na, ulabel_len)) {
+            ntfs_free(label);
             ntfs_free(ulabel);
             ntfsUnlock(vd);
             return false;
@@ -671,6 +630,7 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
         
         // Write the new volume name
         if (ntfs_attr_pwrite(na, 0, ulabel_len, ulabel) != ulabel_len) {
+            ntfs_free(label);
             ntfs_free(ulabel);
             ntfsUnlock(vd);
             return false;
@@ -680,6 +640,7 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
         
         // It doesn't, create it now
         if (ntfs_attr_add(vd->vol->vol_ni, AT_VOLUME_NAME, NULL, 0, (u8*)ulabel, ulabel_len)) {
+            ntfs_free(label);
             ntfs_free(ulabel);
             ntfsUnlock(vd);
             return false;
@@ -687,9 +648,12 @@ bool ntfsSetVolumeName (const char *name, const char *volumeName)
         
     }
 
-    // Reset the volumes name cache (as it has now been changed)
-    vd->name[0] = '\0';
-    
+    // Update the volumes name (as it has now been changed)
+    if(vd->vol->vol_name) {
+        ntfs_free(vd->vol->vol_name);
+        vd->vol->vol_name = label;
+    }
+
     // Close the volume name attribute
     if (na)
         ntfs_attr_close(na);
@@ -714,3 +678,4 @@ const devoptab_t *ntfsGetDevOpTab (void)
 {
     return &devops_ntfs;
 }
+

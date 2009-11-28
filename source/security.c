@@ -38,9 +38,6 @@
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
-#ifdef HAVE_MATH_H
-#include <math.h>
-#endif
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
 #endif
@@ -3257,7 +3254,7 @@ int ntfs_sd_add_everyone(ntfs_inode *ni)
 	ret = ntfs_attr_add(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0, (u8*)sd,
 			    sd_len);
 	if (ret)
-		ntfs_log_perror("Failed to add initial SECURITY_DESCRIPTOR\n");
+		ntfs_log_perror("Failed to add initial SECURITY_DESCRIPTOR");
 	
 	free(sd);
 	return ret;

@@ -191,9 +191,6 @@ int ntfsInitVolume (ntfs_vd *vd)
     // Initialise the volume lock
     LWP_MutexInit(&vd->lock, false);
     
-    // Reset the volumes name cache
-    vd->name[0] = '\0';
-    
     // Reset the volumes current directory
     vd->cwd_ni = NULL;
     

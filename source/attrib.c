@@ -36,9 +36,6 @@
 #ifdef HAVE_STDLIB_H
 #include <stdlib.h>
 #endif
-#ifdef HAVE_LIMITS_H
-#include <limits.h>
-#endif
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
@@ -1653,6 +1650,7 @@ retry:
 		if (written > 0) {
 			total += written;
 			count -= written;
+			fullcount -= written;
 			b = (const u8*)b + written;
 		}
 		if (written != to_write) {
