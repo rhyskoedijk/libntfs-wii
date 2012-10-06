@@ -4,6 +4,7 @@
  * Copyright (c) 2000-2006 Anton Altaparmakov
  * Copyright (c) 2002-2009 Szabolcs Szakacsits
  * Copyright (c) 2004-2005 Richard Russon
+ * Copyright (c) 2010      Jean-Pierre Andre
  *
  * This program/include file is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as published
@@ -53,6 +54,7 @@
 #include <locale.h>
 #endif
 
+#include "param.h"
 #include "compat.h"
 #include "volume.h"
 #include "attrib.h"
@@ -65,10 +67,12 @@
 #include "logfile.h"
 #include "dir.h"
 #include "logging.h"
+#include "cache.h"
+#include "realpath.h"
 #include "misc.h"
 
 const char *ntfs_home = 
-"Ntfs-3g news, support and information:  http://ntfs-3g.org\n";
+"News, support and information:  http://tuxera.com\n";
 
 static const char *invalid_ntfs_msg =
 "The device '%s' doesn't seem to have a valid NTFS.\n"
@@ -111,7 +115,7 @@ static const char *fakeraid_msg =
 static const char *access_denied_msg =
 "Please check '%s' and the ntfs-3g binary permissions,\n"
 "and the mounting user ID. More explanation is provided at\n"
-"http://ntfs-3g.org/support.html#unprivileged\n";
+"http://tuxera.com/community/ntfs-3g-faq/#unprivileged\n";
 
 /**
  * ntfs_volume_alloc - Create an NTFS volume object and initialise it
@@ -200,6 +204,7 @@ static int __ntfs_volume_release(ntfs_volume *v)
 	ntfs_free_lru_caches(v);
 	free(v->vol_name);
 	free(v->upcase);
+	if (v->locase) free(v->locase);
 	free(v->attrdef);
 	free(v);
 
@@ -370,6 +375,12 @@ mft_has_no_attr_list:
 	/* Done with the $Mft mft record. */
 	ntfs_attr_put_search_ctx(ctx);
 	ctx = NULL;
+
+	/* Update the size fields in the inode. */
+	vol->mft_ni->data_size = vol->mft_na->data_size;
+	vol->mft_ni->allocated_size = vol->mft_na->allocated_size;
+	set_nino_flag(vol->mft_ni, KnownSize);
+
 	/*
 	 * The volume is now setup so we can use all read access functions.
 	 */
@@ -479,14 +490,24 @@ ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev, unsigned long flags)
 		goto error_exit;
 	
 	/* Create the default upcase table. */
-	vol->upcase_len = 65536;
-	vol->upcase = ntfs_malloc(vol->upcase_len * sizeof(ntfschar));
-	if (!vol->upcase)
+	vol->upcase_len = ntfs_upcase_build_default(&vol->upcase);
+	if (!vol->upcase_len || !vol->upcase)
 		goto error_exit;
+
+	/* Default with no locase table and case sensitive file names */
+	vol->locase = (ntfschar*)NULL;
+	NVolSetCaseSensitive(vol);
 	
-	ntfs_upcase_table_build(vol->upcase,
-			vol->upcase_len * sizeof(ntfschar));
-	
+		/* by default, all files are shown and not marked hidden */
+	NVolSetShowSysFiles(vol);
+	NVolSetShowHidFiles(vol);
+	NVolClearHideDotFiles(vol);
+		/* set default compression */
+#if DEFAULT_COMPRESSION
+	NVolSetCompression(vol);
+#else
+	NVolClearCompression(vol);
+#endif
 	if (flags & MS_RDONLY)
 		NVolSetReadOnly(vol);
 	
@@ -760,6 +781,70 @@ out:
 	return errno ? -1 : 0;
 }
 
+/*
+ *		Make sure a LOGGED_UTILITY_STREAM attribute named "$TXF_DATA"
+ *	on the root directory is resident.
+ *	When it is non-resident, the partition cannot be mounted on Vista
+ *	(see http://support.microsoft.com/kb/974729)
+ *
+ *	We take care to avoid this situation, however this can be a
+ *	consequence of having used an older version (including older
+ *	Windows version), so we had better fix it.
+ *
+ *	Returns 0 if unneeded or successful
+ *		-1 if there was an error, explained by errno
+ */
+
+static int fix_txf_data(ntfs_volume *vol)
+{
+	void *txf_data;
+	s64 txf_data_size;
+	ntfs_inode *ni;
+	ntfs_attr *na;
+	int res;
+
+	res = 0;
+	ntfs_log_debug("Loading root directory\n");
+	ni = ntfs_inode_open(vol, FILE_root);
+	if (!ni) {
+		ntfs_log_perror("Failed to open root directory");
+		res = -1;
+	} else {
+		/* Get the $TXF_DATA attribute */
+		na = ntfs_attr_open(ni, AT_LOGGED_UTILITY_STREAM, TXF_DATA, 9);
+		if (na) {
+			if (NAttrNonResident(na)) {
+				/*
+				 * Fix the attribute by truncating, then
+				 * rewriting it.
+				 */
+				ntfs_log_debug("Making $TXF_DATA resident\n");
+				txf_data = ntfs_attr_readall(ni,
+						AT_LOGGED_UTILITY_STREAM,
+						TXF_DATA, 9, &txf_data_size);
+				if (txf_data) {
+					if (ntfs_attr_truncate(na, 0)
+					    || (ntfs_attr_pwrite(na, 0,
+						 txf_data_size, txf_data)
+							!= txf_data_size))
+						res = -1;
+					free(txf_data);
+				}
+			if (res)
+				ntfs_log_error("Failed to make $TXF_DATA resident\n");
+			else
+				ntfs_log_error("$TXF_DATA made resident\n");
+			}
+			ntfs_attr_close(na);
+		}
+		if (ntfs_inode_close(ni)) {
+			ntfs_log_perror("Failed to close root");
+			res = -1;
+		}
+	}
+	return (res);
+}
+
 /**
  * ntfs_device_mount - open ntfs volume
  * @dev:	device to open
@@ -794,6 +879,7 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, unsigned long flags)
 	VOLUME_INFORMATION *vinf;
 	ntfschar *vname;
 	int i, j, eo;
+	unsigned int k;
 	u32 u;
 
 	vol = ntfs_volume_startup(dev, flags);
@@ -951,6 +1037,17 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, unsigned long flags)
 		ntfs_log_perror("Failed to close $UpCase");
 		goto error_exit;
 	}
+	/* Consistency check of $UpCase, restricted to plain ASCII chars */
+	k = 0x20;
+	while ((k < vol->upcase_len)
+	    && (k < 0x7f)
+	    && (le16_to_cpu(vol->upcase[k])
+			== ((k < 'a') || (k > 'z') ? k : k + 'A' - 'a')))
+		k++;
+	if (k < 0x7f) {
+		ntfs_log_error("Corrupted file $UpCase\n");
+		goto io_error_exit;
+	}
 
 	/*
 	 * Now load $Volume and set the version information and flags in the
@@ -1045,9 +1142,9 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, unsigned long flags)
 				goto error_exit;
 			
 			for (j = 0; j < (s32)u; j++) {
-				ntfschar uc = le16_to_cpu(vname[j]);
+				u16 uc = le16_to_cpu(vname[j]);
 				if (uc > 0xff)
-					uc = (ntfschar)'_';
+					uc = (u16)'_';
 				vol->vol_name[j] = (char)uc;
 			}
 			vol->vol_name[u] = '\0';
@@ -1098,7 +1195,7 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, unsigned long flags)
 	 * Check for dirty logfile and hibernated Windows.
 	 * We care only about read-write mounts.
 	 */
-	if (!(flags & MS_RDONLY)) {
+	if (!(flags & (MS_RDONLY | MS_FORENSIC))) {
 		if (!(flags & MS_IGNORE_HIBERFILE) && 
 		    ntfs_volume_check_hiberfile(vol, 1) < 0)
 			goto error_exit;
@@ -1110,6 +1207,9 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, unsigned long flags)
 			if (ntfs_logfile_reset(vol))
 				goto error_exit;
 		}
+		/* make $TXF_DATA resident if present on the root directory */
+		if (fix_txf_data(vol))
+			goto error_exit;
 	}
 
 	return vol;
@@ -1124,6 +1224,58 @@ error_exit:
 	__ntfs_volume_release(vol);
 	errno = eo;
 	return NULL;
+}
+
+/*
+ *		Set appropriate flags for showing NTFS metafiles
+ *	or files marked as hidden.
+ *	Not set in ntfs_mount() to avoid breaking existing tools.
+ */
+
+int ntfs_set_shown_files(ntfs_volume *vol,
+			BOOL show_sys_files, BOOL show_hid_files,
+			BOOL hide_dot_files)
+{
+	int res;
+
+	res = -1;
+	if (vol) {
+		NVolClearShowSysFiles(vol);
+		NVolClearShowHidFiles(vol);
+		NVolClearHideDotFiles(vol);
+		if (show_sys_files)
+			NVolSetShowSysFiles(vol);
+		if (show_hid_files)
+			NVolSetShowHidFiles(vol);
+		if (hide_dot_files)
+			NVolSetHideDotFiles(vol);
+		res = 0;
+	}
+	if (res)
+		ntfs_log_error("Failed to set file visibility\n");
+	return (res);
+}
+
+/*
+ *		Set ignore case mode
+ */
+
+int ntfs_set_ignore_case(ntfs_volume *vol)
+{
+	int res;
+
+	res = -1;
+	if (vol && vol->upcase) {
+		vol->locase = ntfs_locase_table_build(vol->upcase,
+					vol->upcase_len);
+		if (vol->locase) {
+			NVolClearCaseSensitive(vol);
+			res = 0;
+		}
+	}
+	if (res)
+		ntfs_log_error("Failed to set ignore_case mode\n");
+	return (res);
 }
 
 /**
@@ -1221,18 +1373,6 @@ int ntfs_umount(ntfs_volume *vol, const BOOL force __attribute__((unused)))
 
 #ifdef HAVE_MNTENT_H
 
-#ifndef HAVE_REALPATH
-/**
- * realpath - If there is no realpath on the system
- */
-static char *realpath(const char *path, char *resolved_path)
-{
-	strncpy(resolved_path, path, PATH_MAX);
-	resolved_path[PATH_MAX] = '\0';
-	return resolved_path;
-}
-#endif
-
 /**
  * ntfs_mntent_check - desc
  *
@@ -1256,7 +1396,7 @@ static int ntfs_mntent_check(const char *file, unsigned long *mnt_flags)
 		err = errno;
 		goto exit;
 	}
-	if (!realpath(file, real_file)) {
+	if (!ntfs_realpath_canonicalize(file, real_file)) {
 		err = errno;
 		goto exit;
 	}
@@ -1265,7 +1405,7 @@ static int ntfs_mntent_check(const char *file, unsigned long *mnt_flags)
 		goto exit;
 	}
 	while ((mnt = getmntent(f))) {
-		if (!realpath(mnt->mnt_fsname, real_fsname))
+		if (!ntfs_realpath_canonicalize(mnt->mnt_fsname, real_fsname))
 			continue;
 		if (!strcmp(real_file, real_fsname))
 			break;
@@ -1432,7 +1572,7 @@ error_exit:
  *
  * Return 0 if successful and -1 if not with errno set to the error code.
  */
-int ntfs_volume_write_flags(ntfs_volume *vol, const u16 flags)
+int ntfs_volume_write_flags(ntfs_volume *vol, const le16 flags)
 {
 	ATTR_RECORD *a;
 	VOLUME_INFORMATION *c;
@@ -1591,4 +1731,114 @@ int ntfs_volume_get_free_space(ntfs_volume *vol)
 			ret = 0;
 	}
 	return (ret);
+}
+
+/**
+ * ntfs_volume_rename - change the current label on a volume
+ * @vol:	volume to change the label on
+ * @label:	the new label
+ * @label_len:	the length of @label in ntfschars including the terminating NULL
+ *		character, which is mandatory (the value can not exceed 128)
+ *
+ * Change the label on the volume @vol to @label.
+ */
+int ntfs_volume_rename(ntfs_volume *vol, ntfschar *label, int label_len)
+{
+	ntfs_attr *na;
+	char *old_vol_name;
+	char *new_vol_name = NULL;
+	int new_vol_name_len;
+	int err;
+
+	if (NVolReadOnly(vol)) {
+		ntfs_log_error("Refusing to change label on read-only mounted "
+			"volume.\n");
+		errno = EROFS;
+		return -1;
+	}
+
+	label_len *= sizeof(ntfschar);
+	if (label_len > 0x100) {
+		ntfs_log_error("New label is too long. Maximum %u characters "
+				"allowed.\n",
+				(unsigned)(0x100 / sizeof(ntfschar)));
+		errno = ERANGE;
+		return -1;
+	}
+
+	na = ntfs_attr_open(vol->vol_ni, AT_VOLUME_NAME, AT_UNNAMED, 0);
+	if (!na) {
+		if (errno != ENOENT) {
+			err = errno;
+			ntfs_log_perror("Lookup of $VOLUME_NAME attribute "
+				"failed");
+			goto err_out;
+		}
+
+		/* The volume name attribute does not exist.  Need to add it. */
+		if (ntfs_attr_add(vol->vol_ni, AT_VOLUME_NAME, AT_UNNAMED, 0,
+			(u8*) label, label_len))
+		{
+			err = errno;
+			ntfs_log_perror("Encountered error while adding "
+				"$VOLUME_NAME attribute");
+			goto err_out;
+		}
+	}
+	else {
+		s64 written;
+
+		if (NAttrNonResident(na)) {
+			err = errno;
+			ntfs_log_error("Error: Attribute $VOLUME_NAME must be "
+					"resident.\n");
+			goto err_out;
+		}
+
+		if (na->data_size != label_len) {
+			if (ntfs_attr_truncate(na, label_len)) {
+				err = errno;
+				ntfs_log_perror("Error resizing resident "
+					"attribute");
+				goto err_out;
+			}
+		}
+
+		if (label_len) {
+			written = ntfs_attr_pwrite(na, 0, label_len, label);
+			if (written == -1) {
+				err = errno;
+				ntfs_log_perror("Error when writing "
+					"$VOLUME_NAME data");
+				goto err_out;
+			}
+			else if (written != label_len) {
+				err = EIO;
+				ntfs_log_error("Partial write when writing "
+					"$VOLUME_NAME data.");
+				goto err_out;
+
+			}
+		}
+	}
+
+	new_vol_name_len =
+		ntfs_ucstombs(label, label_len, &new_vol_name, 0);
+	if (new_vol_name_len == -1) {
+		err = errno;
+		ntfs_log_perror("Error while decoding new volume name");
+		goto err_out;
+	}
+
+	old_vol_name = vol->vol_name;
+	vol->vol_name = new_vol_name;
+	free(old_vol_name);
+
+	err = 0;
+err_out:
+	if (na)
+		ntfs_attr_close(na);
+	if (err)
+		errno = err;
+	return err ? -1 : 0;
 }
