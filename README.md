@@ -1,6 +1,5 @@
 
-INTRODUCTION
-============
+## Introduction
 
 The NTFS-3G driver is an open source, freely available read/write NTFS driver 
 for Linux, FreeBSD, Mac OS X, NetBSD, Solaris and Haiku. It provides safe and 
@@ -28,27 +27,32 @@ web site at
 For more details on the NTFS-3G project see the 'original' folder included
 with this package.
 
-COMPILING AND INSTALLATION
-==========================
+## Compiling and Installing
 
-Make sure you have devKitPPC and the latest libogc installed. Then type:  
+Make sure you have [devKitPro](https://devkitpro.org/wiki/Getting_Started) and 
+the latest Nintendo GameCube/Wii development component (libgc/libwii) installed. 
+Then type:  
 
+````bash
  make
  make install      # or 'sudo make install' if you aren't root.
+````
 
-
-USAGE
-=====
+## Usage
 
 NTFS related routines can be accessed by adding the following line to your
 source file(s).
 
+````cpp
  #include <ntfs.h>
+````
 
-When compiling you must also link against the libntfs. To do this add -lntfs
-to the LIBS section of your application Makefile. For example:
+When compiling you must also link against the libntfs. To do this add `-lntfs`
+to the `LIBS` section of your application Makefile. For example:
 
+````makefile
  LIBS := -lwiiuse -lbte -lntfs -lfat -logc -lm
+````
 
 For a more practical example of using NTFS in your application,
-see the included 'example' folder.
+see the included `example` directory.
